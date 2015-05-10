@@ -14,7 +14,7 @@
 -----------------------------------------------------------------------------
 {-#LANGUAGE CPP, ForeignFunctionInterface, TypeSynonymInstances, FlexibleInstances
             , OverloadedStrings, DeriveDataTypeable, UndecidableInstances
-            , OverlappingInstances #-}
+            , OverlappingInstances, MultiParamTypeClasses #-}
 module Haste.Perch where
 import Data.Typeable
 import Haste hiding (Attribute)
@@ -28,70 +28,80 @@ import Data.String
 import Control.Monad.IO.Class
 import Control.Applicative
 
+newtype Monad m => PerchM m a = Perch{build :: Elem -> m Elem} deriving Typeable
 
-newtype PerchM a= Perch{build :: Elem -> IO Elem} deriving Typeable
+type Perch m = PerchM m ()
 
-type Perch = PerchM ()
-
-instance Monoid (PerchM a) where
+instance Monad m => Monoid (PerchM m a) where
     mappend mx my= Perch $ \e -> do
          build mx e
          build my e
          return e
     mempty  = Perch return
 
-instance Functor PerchM
-instance Applicative PerchM
+instance Monad m => Functor (PerchM m) where
+  fmap f m = do
+    a <- m
+    return $ f a
 
-instance Monad PerchM where
+instance Monad m => Applicative (PerchM m) where
+  pure = return
+  (<*>) appf m = do
+    f <- appf
+    a <- m
+    return $ f a
+
+instance Monad m => Monad (PerchM m) where
    (>>) x y= mappend (unsafeCoerce x) y
    (>>=) = error "bind (>>=) invocation in the Perch monad creating DOM elements"
    return  = mempty
 
-instance MonadIO PerchM where
-  liftIO mx= Perch $ \e -> mx >> return e
+instance MonadIO m => MonadIO (PerchM m) where
+  liftIO mx= Perch $ \e -> liftIO mx >> return e
 
-instance IsString Perch where
+instance (MonadIO m, Functor m) => IsString (Perch m) where
   fromString= toElem
 
-class ToElem a where
-  toElem :: a -> Perch
+class Monad m => ToElem m a where
+  toElem :: a -> Perch m
 
-instance ToElem String where
+instance (MonadIO m,Functor m) => ToElem m String where
    toElem s= Perch $ \e -> do
         e' <- newTextElem s
         addChild e' e
         return e'
 
-instance Show a => ToElem a where toElem = toElem . show
+instance (Show a, MonadIO m, Functor m) => ToElem m a where
+  toElem = toElem . show
 
-instance ToElem (PerchM a) where toElem e = unsafeCoerce e
+instance MonadIO m => ToElem m (PerchM m a) where
+  toElem e = liftIO $ unsafeCoerce e
 
 attr tag (n, v)=Perch $ \e -> do
         tag' <- build tag e
         setAttr tag' n v
         return tag'
 
-nelem :: String -> Perch
+nelem :: (MonadIO m,Functor m) => String -> Perch m
 nelem s= Perch $ \e ->do
         e' <- newElem s
         addChild e' e
         return e'
 
-child :: ToElem a => Perch -> a -> Perch
+child :: MonadIO m => ToElem m a => Perch m -> a -> Perch m
 child me ch= Perch $ \e' -> do
         e <- build me e'
         let t = toElem ch
         r <- build t e
         return e
 
-setHtml :: Perch -> String -> Perch
+setHtml :: (MonadIO m,Functor m) => Perch m -> String -> Perch m
 setHtml me text= Perch $ \e' -> do
     e <- build me e'
     inner e text
     return e'
   where
-  inner :: Elem -> String -> IO ()
+  inner :: (MonadIO m,Functor m) => Elem -> String -> m ()
   inner e txt = setProp e "innerHTML" txt
 
 -- | create an element and add a Haste event handler to it.
@@ -120,6 +130,7 @@ addEvent be event action= Perch $ \e -> do
 
 -- Leaf DOM nodes
 --
+area,base,br,col,embed,hr,img,input,keygen,link,menuitem,meta,param,source,track,wbr::(MonadIO m,Functor m) => Perch m
 area = nelem "area"
 base = nelem "base"
 br = nelem "br"
@@ -237,17 +248,18 @@ ctag tag cont= nelem tag `child` cont
 -- HTML4 support
 center cont= nelem "center" `child` cont
 
-noHtml= mempty :: Perch
+noHtml :: MonadIO m => Perch m
+noHtml= mempty
 
 type Attribute = (String,String)
 
 class Attributable h where
  (!) :: h -> Attribute -> h
 
-instance ToElem a => Attributable (a -> Perch) where
+instance (Functor m, MonadIO m, ToElem m a) => Attributable (a -> Perch m) where
  (!) pe atrib = \e -> pe e `attr` atrib
 
-instance Attributable Perch where
+instance (MonadIO m, Functor m) => Attributable (Perch m) where
  (!) = attr
 
 
@@ -269,37 +281,37 @@ src= atr "src"
 ---------------- DOM Tree navigation and edition
 
 -- | return the current node
-this :: Perch
+this :: MonadIO m => Perch m
 this= Perch $ \e -> return e
 
 -- | goes to the parent node of the first and execute the second
-goParent :: Perch -> Perch -> Perch
+goParent :: MonadIO m => Perch m -> Perch m -> Perch m
 goParent pe pe'= Perch $ \e' -> do
   e <- build pe e'
-  p <- parent e
+  p <- liftIO $ parent e
   e2 <- build pe' p
   return e2
 
 -- | delete the current node. Return the parent
-delete :: Perch
+delete :: MonadIO m => Perch m
 delete= Perch $ \e -> do
-             p <- parent e
+             p <- liftIO $ parent e
              removeChild e p
              return p
 
 -- | delete the children of the current node.
-clear :: Perch
+clear :: MonadIO m => Perch m
 clear= Perch $ \e -> clearChildren e >> return e
 
 -- | replace the current node with a new one
-outer ::  Perch -> Perch -> Perch
+outer ::  MonadIO m => Perch m -> Perch m -> Perch m
 outer olde  newe= Perch $ \e'' -> do
    e  <- build olde e''
    e' <- build newe e''
-   replace e e'
+   liftIO $ replace e e'
 
 replace :: Elem -> Elem -> IO Elem
-replace= ffi  "(function(e,e1){var par=  e.parentNode;par.replaceChild(e1,e);return e1;})"
+replace= ffi "(function(e,e1){var par=  e.parentNode;par.replaceChild(e1,e);return e1;})"
 
 
 
@@ -329,24 +341,26 @@ getDocument= ffi  "(function(){return document;})"
 -- >
 -- >      addEvent this OnClick $ \_ _ -> do
 -- >          forElems' ".modify" $  this ! style "color:red"
-forElems' :: String -> Perch -> IO ()
+forElems' :: MonadIO m => String -> Perch m -> m ()
 forElems' for doit= do
     (flip build) undefined (forElems for doit)
     return ()
 
 -- | a more declarative synmonym of `forElems'`
+withElems' :: MonadIO m => String -> Perch m -> m ()
 withElems'= forElems'
 
 -- ! JQuery-like DOM manipulation: using a selector for querySelectorAll,
 -- it apply the Perch DOM manipulation of the second parameter for each of the matches
-forElems :: String -> Perch -> Perch
+forElems :: MonadIO m => String -> Perch m -> Perch m
 forElems selectors dosomething= Perch $ \e -> do
     es <- queryAll  selectors
     mapM (build dosomething) es
     return e
     where
-    queryAll ::  String -> IO  [Elem]
-    queryAll = ffi "(function(sel){return document.querySelectorAll(sel);})"
+    queryAll ::  MonadIO m => String -> m  [Elem]
+    queryAll str = liftIO $ (ffi "(function(sel){return document.querySelectorAll(sel);})" str :: IO [Elem])
 
 -- | a more declarative synmonym of `forElems`
+withElems :: MonadIO m => String -> Perch m -> Perch m
 withElems= forElems
